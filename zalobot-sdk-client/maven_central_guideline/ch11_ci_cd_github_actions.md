@@ -1,0 +1,294 @@
+# Chapter 11: CI/CD with GitHub Actions — Automated Publishing
+
+> Running `mvn deploy -Prelease` on your laptop works, but it's not reproducible, not auditable, and depends on your machine being configured correctly. Automating deployment through CI/CD is the professional approach.
+
+---
+
+## Why Automate?
+
+| Manual Deploy | Automated Deploy |
+|---|---|
+| Depends on your machine's GPG setup | Uses ephemeral CI environment with imported key |
+| Depends on your `settings.xml` | Uses GitHub Secrets injected at runtime |
+| No audit trail (did version X really come from commit Y?) | Git tag → CI build → published artifact (full traceability) |
+| Easy to make mistakes (wrong branch, uncommitted changes) | Always builds from a clean checkout of the tagged commit |
+| Only you can deploy | Any maintainer with push access can tag a release |
+
+---
+
+## The Trigger: Git Tags
+
+We'll configure GitHub Actions to trigger on tag pushes matching `v*`:
+
+```
+Developer                         GitHub Actions
+─────────                         ──────────────
+git tag v0.0.1                    │
+git push origin v0.0.1 ──────────► tag push detected
+                                  │ tag matches 'v*'
+                                  │ workflow triggers
+                                  │
+                                  ├── checkout code at tag
+                                  ├── setup JDK + Maven settings
+                                  ├── import GPG key
+                                  ├── set version from tag
+                                  └── ./mvnw deploy -Prelease
+                                      → artifacts published to Maven Central
+```
+
+---
+
+## GitHub Secrets Configuration
+
+Before creating the workflow, add these secrets to your GitHub repository:
+
+Go to: **Repository → Settings → Secrets and variables → Actions → New repository secret**
+
+| Secret Name | Value | Source |
+|---|---|---|
+| `MAVEN_CENTRAL_USERNAME` | Central Portal generated username (e.g., `aB1cD2eF`) | Chapter 7, Step 3 |
+| `MAVEN_CENTRAL_PASSWORD` | Central Portal generated token | Chapter 7, Step 3 |
+| `GPG_PRIVATE_KEY` | Output of `gpg --export-secret-keys --armor ABCD1234` | Chapter 6 |
+| `GPG_PASSPHRASE` | Your GPG key passphrase | Chapter 6 |
+
+> **Insight: Never Commit Keys or Credentials**
+>
+> GitHub Actions secrets are:
+> - Encrypted at rest
+> - Masked in workflow logs (the value shows as `***`)
+> - Only accessible to workflows running in the repository
+> - Not accessible in pull requests from forks (prevents credential exfiltration)
+>
+> This is the only safe way to handle credentials in CI/CD. Environment variables in workflow files, committed `.env` files, or hardcoded values are all security vulnerabilities.
+
+---
+
+## The Complete Workflow File
+
+Create `.github/workflows/publish.yml`:
+
+```yaml
+name: Publish to Maven Central
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout the code at the tagged commit
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Setup JDK and generate settings.xml with Central Portal credentials
+      - name: Setup JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+
+      # 3. Import GPG private key for artifact signing
+      - name: Import GPG Key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+      # 4. Extract version from the git tag (v0.0.1 → 0.0.1)
+      - name: Set Version from Tag
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          ./mvnw versions:set -DnewVersion=$VERSION --batch-mode
+
+      # 5. Build, test, sign, and deploy to Maven Central
+      - name: Deploy to Maven Central
+        run: ./mvnw deploy -Prelease --batch-mode -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}"
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+```
+
+---
+
+## Step-by-Step Breakdown
+
+### Step 1: Checkout
+
+```yaml
+- name: Checkout
+  uses: actions/checkout@v4
+```
+
+Clones the repository at the exact commit the tag points to. This ensures the build matches exactly what was tagged — no uncommitted changes, no wrong branch.
+
+### Step 2: Setup JDK + Settings.xml
+
+```yaml
+- name: Setup JDK 25
+  uses: actions/setup-java@v4
+  with:
+    java-version: '25'
+    distribution: 'temurin'
+    server-id: central
+    server-username: MAVEN_CENTRAL_USERNAME
+    server-password: MAVEN_CENTRAL_PASSWORD
+```
+
+This action does two things:
+1. Installs JDK 25 (Temurin distribution)
+2. **Generates `~/.m2/settings.xml`** with a `<server>` block:
+
+```xml
+<!-- Auto-generated by setup-java action -->
+<settings>
+    <servers>
+        <server>
+            <id>central</id>
+            <username>${env.MAVEN_CENTRAL_USERNAME}</username>
+            <password>${env.MAVEN_CENTRAL_PASSWORD}</password>
+        </server>
+    </servers>
+</settings>
+```
+
+> **Insight: `setup-java` Generates `settings.xml` for You**
+>
+> The `server-id`, `server-username`, and `server-password` parameters tell `setup-java` to create a `settings.xml` automatically. The `server-username` and `server-password` values are **environment variable names** (not the actual secrets) — the action writes `${env.MAVEN_CENTRAL_USERNAME}` into the XML, and Maven resolves the env var at runtime.
+>
+> This means no credentials are written to disk in plaintext — they're resolved from environment variables that exist only during the workflow run.
+
+### Step 3: Import GPG Key
+
+```yaml
+- name: Import GPG Key
+  run: |
+    echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+```
+
+This pipes the ASCII-armored private key (exported in Chapter 6) into `gpg --import`. The `--batch` flag suppresses interactive prompts.
+
+After this step, the GPG key is available in the CI runner's keyring for the `maven-gpg-plugin` to use.
+
+### Step 4: Set Version from Tag
+
+```yaml
+- name: Set Version from Tag
+  run: |
+    VERSION=${GITHUB_REF#refs/tags/v}
+    echo "VERSION=$VERSION" >> $GITHUB_ENV
+    ./mvnw versions:set -DnewVersion=$VERSION --batch-mode
+```
+
+When you push tag `v0.0.1`:
+- `GITHUB_REF` = `refs/tags/v0.0.1`
+- `${GITHUB_REF#refs/tags/v}` strips the prefix → `0.0.1`
+- `versions:set` updates all 6 POMs to version `0.0.1`
+
+This ensures the deployed version exactly matches the git tag.
+
+### Step 5: Deploy
+
+```yaml
+- name: Deploy to Maven Central
+  run: ./mvnw deploy -Prelease --batch-mode -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}"
+  env:
+    MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+    MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+```
+
+This runs the full pipeline from Chapter 9:
+- `./mvnw` uses the Maven Wrapper (Chapter 10) for consistent Maven version
+- `-Prelease` activates the release profile (source, javadoc, GPG, Central Portal plugins)
+- `--batch-mode` suppresses interactive prompts and produces log-friendly output
+- `-Dgpg.passphrase` passes the GPG passphrase as a system property
+- `env:` block makes Central Portal credentials available as environment variables
+
+---
+
+## The Complete CI/CD Flow
+
+```
+Developer tags a release:
+$ git tag v0.0.1
+$ git push origin v0.0.1
+        │
+        ▼
+GitHub Actions detects tag push (matches 'v*')
+        │
+        ▼
+┌─────────────────────────────────────────────┐
+│ Ubuntu runner (ephemeral — destroyed after)  │
+│                                              │
+│  1. git checkout at tag v0.0.1               │
+│  2. Install JDK 25 + generate settings.xml  │
+│  3. Import GPG private key from secret       │
+│  4. mvn versions:set -DnewVersion=0.0.1     │
+│  5. ./mvnw deploy -Prelease --batch-mode    │
+│     │                                        │
+│     ├── compile all 5 modules               │
+│     ├── run all tests                        │
+│     ├── generate source JARs                 │
+│     ├── generate javadoc JARs                │
+│     ├── GPG sign ~20 artifacts               │
+│     └── upload bundle to Central Portal      │
+│                                              │
+│  Runner destroyed (GPG key, settings gone)   │
+└──────────────────────────────────────────────┘
+        │
+        ▼
+Central Portal validates → publishes to Maven Central
+        │
+        ▼
+https://repo.maven.apache.org/maven2/dev/linhvu/
+  All 6 modules available within ~30 minutes
+```
+
+---
+
+## Verifying the Workflow
+
+After pushing a tag, monitor the workflow:
+
+1. Go to **Repository → Actions** tab
+2. Click the running workflow
+3. Check each step's output
+
+Common failure points:
+
+| Failure | Cause | Fix |
+|---|---|---|
+| `gpg: no default secret key` | GPG key import failed | Verify `GPG_PRIVATE_KEY` secret contains the full `-----BEGIN PGP PRIVATE KEY BLOCK-----` content |
+| `401 Unauthorized` | Central Portal credentials wrong | Regenerate token at central.sonatype.com |
+| `Namespace not verified` | `dev.linhvu` not verified | Complete DNS verification in Central Portal |
+| Tests fail | Code issue | Fix tests before tagging |
+
+---
+
+## Summary
+
+| Concept | What It Means |
+|---|---|
+| Tag-triggered workflow | Push `v*` tag → GitHub Actions runs the publishing pipeline |
+| `setup-java` | Installs JDK and generates `settings.xml` with server credentials |
+| `gpg --batch --import` | Imports the GPG private key from GitHub Secrets into the CI runner |
+| `versions:set` | Updates all POM versions to match the git tag |
+| `--batch-mode` | Non-interactive Maven mode for CI/CD (no prompts, clean log output) |
+| Ephemeral runner | CI runner is destroyed after the job — no credentials persist |
+
+---
+
+## What's Next?
+
+The automation is in place. In Chapter 12, we learn the complete versioning and release workflow — from development through to published release, including semantic versioning and the step-by-step release checklist.
+
+```
+Chapter 10 ──► "Maven Wrapper for reproducible builds"
+Chapter 11 ←── YOU ARE HERE: "Automated publishing with GitHub Actions"
+Chapter 12 ──► "Versioning and release workflow"
+```
